@@ -11,7 +11,7 @@ The server:
 
 ---
 
-## 🚀 Features
+## Features
 
 | Feature | Description |
 |--------|------------|
@@ -61,9 +61,24 @@ src/
 
 ▶ How to Build & Run (without Docker)
 
-1. Install Redis
+1. 🐳 Run with Docker Compose
 
-On macOS (Homebrew):
+Build & start services
+
+docker compose up --build
+
+This will:
+	•	start redis service (Redis 7),
+	•	build and start app service (Netty server),
+	•	expose port 8080 on the host.
+
+Call the endpoint
+
+curl http://localhost:8080/api/dashboard
+
+
+
+2. On macOS (Homebrew):
 
 brew install redis
 brew services start redis
@@ -83,7 +98,7 @@ redis-cli ping
 
 ⸻
 
-2. Build the project
+3. Build the project
 
 mvn clean package
 
@@ -91,34 +106,13 @@ Build does not require Redis to be running — integration test is skipped if Re
 
 ⸻
 
-3. Run the server
+4. Run the server
 
 java -cp target/classes com.jerzymiskiewicz.dashboard.NettyServer
 
 The server will start at:
 
 http://localhost:8080/api/dashboard
-
-
-⸻
-
-🐳 Run with Docker Compose (recommended for Linux)
-
-You can also run the app together with Redis using Docker Compose.
-
-1. Build & start services
-
-docker compose up --build
-
-This will:
-	•	start redis service (Redis 7),
-	•	build and start app service (Netty server),
-	•	expose port 8080 on the host.
-
-2. Call the endpoint
-
-curl http://localhost:8080/api/dashboard
-
 
 ⸻
 
