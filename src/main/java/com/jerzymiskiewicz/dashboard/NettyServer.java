@@ -11,11 +11,14 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 
 public class NettyServer {
+
     private static final int HTTP_PORT = 8080;
-    private static final String REDIS_HOST = "localhost";
-    private static final int REDIS_PORT = 6379;
     private static final int BOSS_THREADS = 1;
     private static final int SO_BACKLOG = 128;
+    private static final String REDIS_HOST =
+            System.getenv().getOrDefault("REDIS_HOST", "localhost");
+    private static final int REDIS_PORT =
+            Integer.parseInt(System.getenv().getOrDefault("REDIS_PORT", "6379"));
 
     public static void main(String[] args) {
         final EventLoopGroup acceptorGroup = new NioEventLoopGroup(BOSS_THREADS);

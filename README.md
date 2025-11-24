@@ -18,7 +18,7 @@ The server:
 | **Non-blocking IO** | Built using Netty event loops |
 | **Parallel external calls** | Uses `CompletableFuture` to fetch data concurrently |
 | **Redis caching** | Stores last successful JSON response |
-| **Fault tolerance (fallback)** | Cached values returned when API requests fail |
+| **Fault tolerance (fallback + cache-first)** | Cached values returned when available, or on failures |
 | **Single endpoint** | `GET /api/dashboard` |
 
 ---
@@ -29,124 +29,159 @@ The server:
 |----------|---------|
 | Java | 17+ (tested on Temurin 21) |
 | Maven | 3.8+ |
-| Redis | running locally on `localhost:6379` |
-| macOS/Linux/Windows | any |
+| Redis | running on `HOST:PORT` (defaults: `localhost:6379`) |
+| OS | Linux/macOS/Windows |
 
-Make sure Redis is running before starting the server:
+Redis can be provided:
+- locally (installed on host),
+- or via Docker / Docker Compose.
 
-```bash
-brew services start redis
-redis-cli ping
+---
 
-Expected output:
+## 📂 Project Structure
 
-PONG
-
-
-⸻
-
-📂 Project Structure
-
+```text
 src/
  ├─ main/java/com/jerzymiskiewicz/dashboard
  │   ├─ NettyServer.java               # Application entry point
  │   ├─ HttpServerInitializer.java     # Netty pipeline configuration
  │   ├─ DashboardHandler.java          # HTTP request handler
  │   └─ service
- │        ├─ DashboardService.java     # Aggregates external data + caching + fallback
- │        ├─ ExternalApiClient.java    # Calls external HTTP APIs asynchronously
+ │        ├─ DashboardService.java     # Cache-first aggregation + fallback logic
+ │        ├─ ExternalApiClient.java    # Async external HTTP API calls
  │        └─ RedisCache.java           # Async Redis operations (Lettuce)
  │
  └─ test/java/com/jerzymiskiewicz/dashboard/service
       ├─ ExternalApiClientTest.java    # Mocks HTTP and verifies error handling
-      ├─ DashboardServiceTest.java     # Tests aggregation + fallback logic
-      └─ RedisCacheTest.java           # Integration test with real Redis
+      ├─ DashboardServiceTest.java     # Tests cache hit/miss and aggregation
+      └─ RedisCacheTest.java           # Integration-style test for Redis
 
 
 ⸻
 
-▶ How to Build & Run
+▶ How to Build & Run (without Docker)
 
-1. Build
+1. Install Redis
+
+On macOS (Homebrew):
+
+brew install redis
+brew services start redis
+
+On Ubuntu/Debian:
+
+sudo apt update
+sudo apt install redis-server
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+
+Check:
+
+redis-cli ping
+# → PONG
+
+
+⸻
+
+2. Build the project
 
 mvn clean package
 
-2. Run
+Build does not require Redis to be running — integration test is skipped if Redis is unavailable.
+
+⸻
+
+3. Run the server
 
 java -cp target/classes com.jerzymiskiewicz.dashboard.NettyServer
 
-The server starts at:
+The server will start at:
 
 http://localhost:8080/api/dashboard
 
 
 ⸻
 
-🧪 Testing Fallback Behavior (Manual)
+🐳 Run with Docker Compose (recommended for Linux)
 
-Step 1 — Generate cached data
+You can also run the app together with Redis using Docker Compose.
+
+1. Build & start services
+
+docker compose up --build
+
+This will:
+	•	start redis service (Redis 7),
+	•	build and start app service (Netty server),
+	•	expose port 8080 on the host.
+
+2. Call the endpoint
 
 curl http://localhost:8080/api/dashboard
 
-Verify stored JSON:
+
+⸻
+
+🧪 Testing Fallback & Cache Behavior (manually)
+
+Step 1 — Generate cached data
+
+With server running:
+
+curl http://localhost:8080/api/dashboard
+
+Check saved cache in Redis:
 
 redis-cli get "dashboard:lastSuccess"
+
+
+⸻
 
 Step 2 — Simulate API failure
 
 Edit ExternalApiClient.java:
 
-String url = "https://uselessfacts.jsph.pl/api/v2/facts/randomXXX"; // intentionally broken
+private static final String RANDOM_FACT_URL = "https://uselessfacts.jsph.pl/api/v2/facts/randomXXX"; // intentionally broken
 
-Restart server and call:
+Rebuild / restart the app, then call:
 
 curl http://localhost:8080/api/dashboard
 
 Expected behavior:
-	•	No new fact fetched
-	•	JSON returned from Redis instead
+	•	external fact API will fail,
+	•	app falls back to existing cached JSON (or fails if cache is empty).
 
 ⸻
 
 🧪 Automated Tests
 
-This project contains meaningful tests that validate core behavior:
+This project contains tests that validate core behavior:
 
 Component	What is tested	Type
-ExternalApiClient	Fails the future when response status is non-2xx	Unit (mocked HTTP client)
-DashboardService	Aggregation + saving to Redis + fallback on failure	Unit (mock API + mock Redis)
-RedisCache	Writing & reading from a real Redis instance	Integration
-
-Key guarantees:
-	•	External API errors do not produce partial data
-	•	Fresh data is persisted with TTL
-	•	When any request fails, cached JSON is returned
+ExternalApiClient	Future completes exceptionally on non-2xx HTTP status	Unit (mocked HttpClient)
+DashboardService	Cache hit (no external calls) and cache miss (aggregate + save to Redis)	Unit (mock API + mock Redis)
+RedisCache	Save & get value from Redis	Integration test (skipped if Redis is not available)
 
 Run tests:
 
 mvn test
 
-Ensure Redis is active:
-
-brew services start redis
-redis-cli ping
-
 
 ⸻
 
 📘 How It Works (Architecture)
-	1.	DashboardHandler receives HTTP GET request.
-	2.	DashboardService triggers 3 asynchronous external calls in parallel.
-	3.	CompletableFuture.allOf() waits for completion.
-	4.	If successful:
-	•	Responses are merged
-	•	JSON is stored in Redis
-	5.	If any API fails:
-	•	Cached result from Redis is returned instead
+	1.	DashboardHandler receives an HTTP GET /api/dashboard request.
+	2.	DashboardService:
+	•	first tries to get JSON from Redis (dashboard:lastSuccess),
+	•	on cache hit: immediately returns cached JSON,
+	•	on cache miss: triggers 3 async API calls (weather, fact, IP) in parallel.
+	3.	CompletableFuture.allOf() waits for completion of all API calls.
+	4.	If all succeed:
+	•	responses are merged into a single JSON,
+	•	result is stored in Redis with TTL.
+	5.	If APIs fail while cache is empty:
+	•	an error is returned (there is nothing to fall back to).
 
-No blocking calls are made inside Netty event loop.
-
-👤 Author
+No blocking calls are made in Netty event loop – all external calls use CompletableFuture and async HTTP client.
 
 Jerzy Miskiewicz
-Java Developer
