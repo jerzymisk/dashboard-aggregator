@@ -1,19 +1,24 @@
-version: "3.9"
-
 services:
+
   redis:
     image: redis:7-alpine
     container_name: dashboard-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   app:
     build: .
     container_name: dashboard-app
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     ports:
       - "8080:8080"

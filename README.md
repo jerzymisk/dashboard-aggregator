@@ -1,181 +1,255 @@
-# Dashboard Aggregator (Netty + CompletableFuture + Redis)
+# Dashboard Aggregator
 
-A non-blocking HTTP server built using **Netty** that aggregates data from three external APIs and returns a single JSON response.
-
-The server:
-- fetches **current weather** from Open-Meteo
-- fetches a **random fact** from uselessfacts API
-- fetches **public IP** from ipify
-- stores the last successful response in **Redis**
-- returns cached data if any service fails (fallback mechanism)
-
----
+A small Netty-based HTTP service that aggregates data from several external APIs, caches the result in Redis, and exposes it as a JSON dashboard.
 
 ## Features
 
-| Feature | Description |
-|--------|------------|
-| **Non-blocking IO** | Built using Netty event loops |
-| **Parallel external calls** | Uses `CompletableFuture` to fetch data concurrently |
-| **Redis caching** | Stores last successful JSON response |
-| **Fault tolerance (fallback + cache-first)** | Cached values returned when available, or on failures |
-| **Single endpoint** | `GET /api/dashboard` |
+- **Netty HTTP server** running on port `8080`
+- **Two endpoints**:
+    - `GET /api/dashboard` – returns aggregated JSON from external APIs (weather, random fact, public IP), with Redis caching
+    - `GET /health` – lightweight health check returning `{"status":"UP"}`
+- **Async non-blocking I/O** using:
+    - Java `HttpClient` (for external APIs)
+    - Lettuce Redis client (async commands)
+- **Redis cache**:
+    - Key: `dashboard:lastSuccess`
+    - TTL: 60 seconds
+    - Transparent cache HIT/MISS logic in `DashboardService`
+- **Clean separation of concerns**:
+    - `ExternalApi` – abstraction over external HTTP APIs
+    - `ExternalApiClient` – production implementation
+    - `RedisCache` – simple async cache wrapper
+    - `DashboardService` – orchestration and aggregation logic
+    - `DashboardHandler` / `HealthHandler` / `HttpServerInitializer` / `NettyServer` – HTTP layer
 
 ---
 
-## 📦 Requirements
+## Architecture Overview
 
-| Component | Version |
-|----------|---------|
-| Java | 17+ (tested on Temurin 21) |
-| Maven | 3.8+ |
-| Redis | running on `HOST:PORT` (defaults: `localhost:6379`) |
-| OS | Linux/macOS/Windows |
+### HTTP Layer
 
-Redis can be provided:
-- locally (installed on host),
-- or via Docker / Docker Compose.
+- **NettyServer**
+    - Boots Netty on port `8080`
+    - Reads Redis host/port from environment:
+        - `REDIS_HOST` (default: `redis`)
+        - `REDIS_PORT` (default: `6379`)
+    - Creates `RedisCache`, `ExternalApiClient`, `DashboardService`
+    - Configures pipeline via `HttpServerInitializer`
+
+- **HttpServerInitializer**
+    - Pipeline:
+        - `HttpServerCodec`
+        - `HttpObjectAggregator`
+        - `HealthHandler` (handles `GET /health`, otherwise forwards)
+        - `DashboardHandler` (handles `GET /api/dashboard`, otherwise returns `404`)
+
+- **HealthHandler**
+    - For `GET /health` returns:
+      ```json
+      {"status":"UP"}
+      ```
+    - For any other request passes it further down the pipeline
+
+- **DashboardHandler**
+    - Routes:
+        - `GET /api/dashboard` → calls `DashboardService#getDashboardJson()`
+        - Any other path → `404 NOT_FOUND`
+    - Sends JSON responses with `Content-Type: application/json; charset=utf-8`
+
+### Service Layer
+
+- **ExternalApi (interface)**
+    - Asynchronous contract for external API calls:
+        - `CompletableFuture<JsonNode> fetchWeather()`
+        - `CompletableFuture<JsonNode> fetchRandomFact()`
+        - `CompletableFuture<JsonNode> fetchPublicIp()`
+
+- **ExternalApiClient (record)**
+    - Implements `ExternalApi` using Java `HttpClient`
+    - Non-blocking HTTP calls
+    - Safe JSON parsing with `ObjectMapper`
+    - Validates required JSON fields:
+        - weather: field `"temp"`
+        - fact: field `"value"`
+        - IP: field `"ip"`
+
+- **RedisCache**
+    - Async wrapper around Lettuce Redis client
+    - Methods:
+        - `save(key, value)`
+        - `save(key, value, long ttlSeconds)`
+        - `save(key, value, Duration ttl)`
+        - `get(key): CompletableFuture<Optional<String>>`
+    - Validates keys and TTL, logs operations
+    - `close()` is idempotent and safely closes client & connection
+
+- **DashboardService**
+    - High-level algorithm:
+        1. Try to read cached JSON from Redis (`dashboard:lastSuccess`)
+        2. On cache HIT → return cached JSON
+        3. On cache MISS:
+            - Fetch weather, fact, and IP in parallel using `ExternalApi`
+            - Build combined JSON:
+              ```json
+              {
+                "weather": { ... },
+                "fact":    { ... },
+                "ip":      { ... }
+              }
+              ```
+            - Save to Redis with TTL
+            - Return JSON to caller (even if Redis save failed)
+    - Uses an internal `DashboardData` record to hold aggregated data
 
 ---
 
-## 📂 Project Structure
+## Endpoints
 
-```text
-src/
- ├─ main/java/com/jerzymiskiewicz/dashboard
- │   ├─ NettyServer.java               # Application entry point
- │   ├─ HttpServerInitializer.java     # Netty pipeline configuration
- │   ├─ DashboardHandler.java          # HTTP request handler
- │   └─ service
- │        ├─ DashboardService.java     # Cache-first aggregation + fallback logic
- │        ├─ ExternalApiClient.java    # Async external HTTP API calls
- │        └─ RedisCache.java           # Async Redis operations (Lettuce)
- │
- └─ test/java/com/jerzymiskiewicz/dashboard/service
-      ├─ ExternalApiClientTest.java    # Mocks HTTP and verifies error handling
-      ├─ DashboardServiceTest.java     # Tests cache hit/miss and aggregation
-      └─ RedisCacheTest.java           # Integration-style test for Redis
+### `GET /health`
+
+- **Description:** Health check
+- **Response:**
+    - Status: `200 OK`
+    - Body:
+      ```json
+      {"status":"UP"}
+      ```
+
+### `GET /api/dashboard`
+
+- **Description:** Returns aggregated dashboard JSON
+- **Response example:**
+  ```json
+  {
+    "weather": {
+      "temp": 1,
+      "...": "..."
+    },
+    "fact": {
+      "value": "Some random fact",
+      "...": "..."
+    },
+    "ip": {
+      "ip": "1.2.3.4"
+    }
+  }
 
 
 ⸻
 
-▶ How to Build & Run (without Docker)
-
-1. 🐳 Run with Docker Compose
-
-Build & start services
-
-docker compose up --build
-
-This will:
-	•	start redis service (Redis 7),
-	•	build and start app service (Netty server),
-	•	expose port 8080 on the host.
-
-Call the endpoint
-
-curl http://localhost:8080/api/dashboard
-
-
-
-2. On macOS (Homebrew):
-
-brew install redis
-brew services start redis
-
-On Ubuntu/Debian:
-
-sudo apt update
-sudo apt install redis-server
-sudo systemctl enable redis-server
-sudo systemctl start redis-server
-
-Check:
-
-redis-cli ping
-# → PONG
-
+Requirements
+•	Java: 21 (LTS)
+•	Maven: 3.9+
+•	Redis: available on REDIS_HOST:REDIS_PORT
+•	(Optional) Docker: to run Redis / build containers easily
 
 ⸻
 
-3. Build the project
+Running Redis with Docker
 
+You can start a local Redis instance using Docker:
+
+docker run --rm -p 6379:6379 --name redis \
+redis:7-alpine
+
+This exposes Redis on localhost:6379, which matches the default test configuration.
+
+⸻
+
+Running Tests
+
+All tests are standard JUnit 5 tests executed via Maven.
+
+# From the project root
+mvn clean test
+
+What is covered:
+•	RedisCacheTest – integration-like tests against a real Redis (on localhost:6379)
+•	ExternalApiClientTest – mocks HttpClient, verifies JSON parsing & error handling
+•	DashboardServiceTest – verifies cache HIT/MISS logic and JSON structure
+•	DashboardHandlerTest – verifies HTTP routing & status codes with EmbeddedChannel
+
+Make sure Redis is running before executing the tests.
+
+⸻
+
+Running the Application Locally
+
+From the project root:
+
+# Build the project
 mvn clean package
 
-Build does not require Redis to be running — integration test is skipped if Redis is unavailable.
+Then run the Netty server (assuming the default JAR name):
+
+java -cp target/dashboard-aggregator-1.0-SNAPSHOT.jar \
+com.jerzymiskiewicz.dashboard.NettyServer
+
+Or if you use a fat JAR with a manifest (depending on your Maven configuration):
+
+java -jar target/dashboard-aggregator-1.0-SNAPSHOT.jar
+
+Environment variables
+
+You can override Redis host/port:
+
+export REDIS_HOST=localhost
+export REDIS_PORT=6379
+
 
 ⸻
 
-4. Run the server
+Quick Manual Test
 
-java -cp target/classes com.jerzymiskiewicz.dashboard.NettyServer
+After starting Redis and the Netty server:
 
-The server will start at:
+# Health check
+curl http://localhost:8080/health
+# -> {"status":"UP"}
 
-http://localhost:8080/api/dashboard
-
-⸻
-
-🧪 Testing Fallback & Cache Behavior (manually)
-
-Step 1 — Generate cached data
-
-With server running:
-
+# Dashboard (first call – cache MISS, external APIs are called)
 curl http://localhost:8080/api/dashboard
 
-Check saved cache in Redis:
-
-redis-cli get "dashboard:lastSuccess"
-
-
-⸻
-
-Step 2 — Simulate API failure
-
-Edit ExternalApiClient.java:
-
-private static final String RANDOM_FACT_URL = "https://uselessfacts.jsph.pl/api/v2/facts/randomXXX"; // intentionally broken
-
-Rebuild / restart the app, then call:
-
+# Dashboard (subsequent calls within TTL – cache HIT)
 curl http://localhost:8080/api/dashboard
 
-Expected behavior:
-	•	external fact API will fail,
-	•	app falls back to existing cached JSON (or fails if cache is empty).
 
 ⸻
 
-🧪 Automated Tests
+Running via Docker (example)
 
-This project contains tests that validate core behavior:
+If you have a Dockerfile in the project, a typical flow looks like this:
 
-Component	What is tested	Type
-ExternalApiClient	Future completes exceptionally on non-2xx HTTP status	Unit (mocked HttpClient)
-DashboardService	Cache hit (no external calls) and cache miss (aggregate + save to Redis)	Unit (mock API + mock Redis)
-RedisCache	Save & get value from Redis	Integration test (skipped if Redis is not available)
+# Build JAR
+mvn clean package
 
-Run tests:
+# Build Docker image
+docker build -t dashboard-aggregator .
 
-mvn test
+# Run together with Redis
+docker network create dashboard-net || true
 
+docker run -d --rm \
+--name redis \
+--network dashboard-net \
+redis:7-alpine
+
+docker run -d --rm \
+--name dashboard-aggregator \
+--network dashboard-net \
+-e REDIS_HOST=redis \
+-e REDIS_PORT=6379 \
+-p 8080:8080 \
+dashboard-aggregator
+
+Then access:
+
+curl http://localhost:8080/health
+curl http://localhost:8080/api/dashboard
 
 ⸻
 
-📘 How It Works (Architecture)
-	1.	DashboardHandler receives an HTTP GET /api/dashboard request.
-	2.	DashboardService:
-	•	first tries to get JSON from Redis (dashboard:lastSuccess),
-	•	on cache hit: immediately returns cached JSON,
-	•	on cache miss: triggers 3 async API calls (weather, fact, IP) in parallel.
-	3.	CompletableFuture.allOf() waits for completion of all API calls.
-	4.	If all succeed:
-	•	responses are merged into a single JSON,
-	•	result is stored in Redis with TTL.
-	5.	If APIs fail while cache is empty:
-	•	an error is returned (there is nothing to fall back to).
-
-No blocking calls are made in Netty event loop – all external calls use CompletableFuture and async HTTP client.
-
-Jerzy Miskiewicz
+Notes
+•	All external calls are asynchronous and non-blocking.
+•	Redis write failures do not break the main dashboard response – the service still returns fresh data.
+•	The design is interface-driven (ExternalApi, RedisCache) for better testability and future extensions.

@@ -7,15 +7,34 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http.HttpHeaderValues;
+
+import io.netty.handler.codec.http.QueryStringDecoder;
 import java.nio.charset.StandardCharsets;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class DashboardHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
+/**
+ * HTTP request handler that exposes:
+ *
+ *   GET /api/dashboard → aggregated JSON from external APIs
+ *   GET /health → instant health probe ("status": "UP")
+ *
+ * This handler is non-blocking: all heavy work is done asynchronously.
+ */
+public final class DashboardHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
-    private static final Logger LOG = LoggerFactory.getLogger(DashboardHandler.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(DashboardHandler.class);
+
+    /** REST routing constants */
     private static final String DASHBOARD_PATH = "/api/dashboard";
+    private static final String HEALTH_PATH = "/health";
+
+    /** Pre-rendered static JSON for health endpoint */
+    private static final String HEALTH_UP_JSON = "{\"status\":\"UP\"}";
+
+    /** MIME type for JSON (UTF-8) */
+    private static final String JSON_CT = "application/json; charset=utf-8";
 
     private final DashboardService dashboardService;
 
@@ -24,54 +43,97 @@ public class DashboardHandler extends SimpleChannelInboundHandler<FullHttpReques
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
-        if (!isDashboardGet(request)) {
-            sendNotFound(ctx);
+    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
+
+        // --- Health check: synchronous, ultra-fast, no external calls ---
+        if (isHealthGet(req)) {
+            sendJson(ctx, HttpResponseStatus.OK, HEALTH_UP_JSON);
             return;
         }
 
-        // ВАЖНО: не блокируем event loop, только регистрируем callback
+        // --- Only GET /api/dashboard is handled; everything else → 404 ---
+        if (!isDashboardGet(req)) {
+            send404(ctx);
+            return;
+        }
+
+        // --- Non-blocking async processing ---
         dashboardService.getDashboardJson()
-                .whenComplete((json, throwable) -> {
-                    if (throwable != null) {
-                        LOG.error("Failed to fetch dashboard", throwable);
-                        sendError(ctx, "Failed to fetch dashboard");
+                .whenComplete((json, err) -> {
+                    if (err != null) {
+                        LOGGER.error("Failed to fetch dashboard", err);
+                        sendJson(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                                buildErrorJson("Failed to fetch dashboard"));
                     } else {
                         sendJson(ctx, HttpResponseStatus.OK, json);
                     }
                 });
     }
 
-    private boolean isDashboardGet(FullHttpRequest request) {
-        return HttpMethod.GET.equals(request.method()) && DASHBOARD_PATH.equals(request.uri());
+    /** True if request is GET /api/dashboard (query params ignored). */
+    private boolean isDashboardGet(FullHttpRequest r) {
+        return isGetTo(r, DASHBOARD_PATH);
     }
 
+    /** True if request is GET /health (query params ignored). */
+    private boolean isHealthGet(FullHttpRequest r) {
+        return isGetTo(r, HEALTH_PATH);
+    }
+
+    /**
+     * Utility method that checks whether the request is GET to a specific path.
+     * Query parameters are ignored by decoding the normalized path.
+     */
+    private boolean isGetTo(FullHttpRequest r, String expectedPath) {
+        return r.method().equals(HttpMethod.GET) && path(r).equals(expectedPath);
+    }
+
+    /**
+     * Extracts clean path without query parameters.
+     * Example: "/api/dashboard?x=1" → "/api/dashboard"
+     */
+    private String path(FullHttpRequest r) {
+        return new QueryStringDecoder(r.uri()).path();
+    }
+
+    /**
+     * Sends a JSON HTTP response with proper headers and closes connection.
+     */
     private void sendJson(ChannelHandlerContext ctx, HttpResponseStatus status, String json) {
         ByteBuf content = Unpooled.copiedBuffer(json, StandardCharsets.UTF_8);
-        FullHttpResponse response = new DefaultFullHttpResponse(
+
+        FullHttpResponse resp = new DefaultFullHttpResponse(
                 HttpVersion.HTTP_1_1,
                 status,
                 content
         );
-        response.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
-        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
-        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+
+        resp.headers().set(HttpHeaderNames.CONTENT_TYPE, JSON_CT);
+        HttpUtil.setContentLength(resp, content.readableBytes());
+
+        // Close connection after sending — no keep-alive
+        ctx.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
     }
 
-    private void sendNotFound(ChannelHandlerContext ctx) {
-        FullHttpResponse response = new DefaultFullHttpResponse(
+    /**
+     * Sends a 404 Not Found without body.
+     */
+    private void send404(ChannelHandlerContext ctx) {
+        FullHttpResponse resp = new DefaultFullHttpResponse(
                 HttpVersion.HTTP_1_1,
-                HttpResponseStatus.NOT_FOUND
+                HttpResponseStatus.NOT_FOUND,
+                Unpooled.EMPTY_BUFFER
         );
-        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+
+        HttpUtil.setContentLength(resp, 0);
+        ctx.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
     }
 
-    private void sendError(ChannelHandlerContext ctx, String message) {
-        String body = "{\"error\":\"" + escapeJson(message) + "\"}";
-        sendJson(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, body);
-    }
-
-    private String escapeJson(String s) {
-        return s == null ? "" : s.replace("\"", "\\\"");
+    /**
+     * Builds a minimal error JSON with safe escaping.
+     */
+    private String buildErrorJson(String msg) {
+        String escaped = msg == null ? "" : msg.replace("\"", "\\\"");
+        return "{\"error\":\"" + escaped + "\"}";
     }
 }

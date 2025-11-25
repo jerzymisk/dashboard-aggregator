@@ -1,70 +1,103 @@
 package com.jerzymiskiewicz.dashboard.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 
 class DashboardServiceTest {
 
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    // Extracted constants to avoid magic strings
     private static final String CACHE_KEY = "dashboard:lastSuccess";
-    private static final long CACHE_TTL_SECONDS = 60L;
+    private static final String WEATHER_FIELD = "weather";
+    private static final String FACT_FIELD = "fact";
+    private static final String IP_FIELD = "ip";
+    private static final String CACHED_JSON_SAMPLE = "{\"cached\":true}";
 
     @Test
-    void givenCacheHit_whenGetDashboardJson_thenReturnsCachedValueAndSkipsApis() {
-        ExternalApiClient apiClient = mock(ExternalApiClient.class);
-        RedisCache redisCache = mock(RedisCache.class);
-        DashboardService service = new DashboardService(apiClient, redisCache);
+    void whenCacheHit_thenExternalApisNotCalled() throws Exception {
+        // given
+        ExternalApi api = mock(ExternalApi.class);
+        RedisCache redis = mock(RedisCache.class);
+        stubCacheHit(redis, CACHED_JSON_SAMPLE);
 
-        String cachedJson = "{\"from\":\"cache\"}";
-        when(redisCache.get(CACHE_KEY))
-                .thenReturn(CompletableFuture.completedFuture(Optional.of(cachedJson)));
+        DashboardService service = newService(api, redis);
 
+        // when
         String result = service.getDashboardJson().join();
 
-        assertEquals(cachedJson, result);
-        // при cache hit внешние сервисы не должны вызываться
-        verifyNoInteractions(apiClient);
+        // then
+        assertEquals(CACHED_JSON_SAMPLE, result);
+        // External APIs should never be called on cache HIT
+        verifyNoInteractions(api);
     }
 
     @Test
-    void givenCacheMiss_andApisSucceed_whenGetDashboardJson_thenAggregatesAndSavesToCache() {
-        ExternalApiClient apiClient = mock(ExternalApiClient.class);
-        RedisCache redisCache = mock(RedisCache.class);
-        DashboardService service = new DashboardService(apiClient, redisCache);
+    void whenCacheMiss_thenApisCalledAndResultSavedToRedis() throws Exception {
+        // given
+        ExternalApi api = mock(ExternalApi.class);
+        RedisCache redis = mock(RedisCache.class);
 
-        // 1) Кэш пустой
-        when(redisCache.get(CACHE_KEY))
-                .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+        stubCacheMiss(redis);
 
-        // 2) API возвращают данные
-        ObjectMapper mapper = new ObjectMapper();
-        ObjectNode weather = mapper.createObjectNode().put("temp", 20);
-        ObjectNode fact = mapper.createObjectNode().put("text", "some fact");
-        ObjectNode ip = mapper.createObjectNode().put("ip", "1.2.3.4");
+        JsonNode weather = mapper.readTree("{\"temp\": 1}");
+        JsonNode fact = mapper.readTree("{\"text\": \"fun fact\"}");
+        JsonNode ip = mapper.readTree("{\"ip\": \"1.2.3.4\"}");
 
-        when(apiClient.getWeather()).thenReturn(CompletableFuture.completedFuture(weather));
-        when(apiClient.getRandomFact()).thenReturn(CompletableFuture.completedFuture(fact));
-        when(apiClient.getPublicIp()).thenReturn(CompletableFuture.completedFuture(ip));
+        stubApiResponses(api, weather, fact, ip);
 
-        when(redisCache.save(eq(CACHE_KEY), anyString(), eq(CACHE_TTL_SECONDS)))
+        when(redis.save(eq(CACHE_KEY), anyString(), anyLong()))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
+        DashboardService service = newService(api, redis);
+
+        // when
         String json = service.getDashboardJson().join();
+        JsonNode root = mapper.readTree(json);
 
-        assertTrue(json.contains("\"weather\""));
-        assertTrue(json.contains("\"fact\""));
-        assertTrue(json.contains("\"ip\""));
+        // then: JSON structure is correct
+        assertEquals(weather, root.get(WEATHER_FIELD));
+        assertEquals(fact, root.get(FACT_FIELD));
+        assertEquals(ip, root.get(IP_FIELD));
 
-        verify(apiClient).getWeather();
-        verify(apiClient).getRandomFact();
-        verify(apiClient).getPublicIp();
-        verify(redisCache).save(eq(CACHE_KEY), anyString(), eq(CACHE_TTL_SECONDS));
+        // Redis must store the newly built value
+        verify(redis).save(eq(CACHE_KEY), anyString(), anyLong());
+
+        // External APIs must be called once
+        verify(api).fetchWeather();
+        verify(api).fetchRandomFact();
+        verify(api).fetchPublicIp();
+    }
+
+    // --- Helpers to configure Redis mock ---
+
+    private static void stubCacheHit(RedisCache redis, String cachedJson) {
+        when(redis.get(CACHE_KEY))
+                .thenReturn(CompletableFuture.completedFuture(Optional.of(cachedJson)));
+    }
+
+    private static void stubCacheMiss(RedisCache redis) {
+        when(redis.get(CACHE_KEY))
+                .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+    }
+
+    // --- Helpers to configure ExternalApi mock ---
+
+    private static void stubApiResponses(ExternalApi api, JsonNode weather, JsonNode fact, JsonNode ip) {
+        when(api.fetchWeather()).thenReturn(CompletableFuture.completedFuture(weather));
+        when(api.fetchRandomFact()).thenReturn(CompletableFuture.completedFuture(fact));
+        when(api.fetchPublicIp()).thenReturn(CompletableFuture.completedFuture(ip));
+    }
+
+    // Factory method for SUT
+    private static DashboardService newService(ExternalApi api, RedisCache redis) {
+        return new DashboardService(api, redis);
     }
 }

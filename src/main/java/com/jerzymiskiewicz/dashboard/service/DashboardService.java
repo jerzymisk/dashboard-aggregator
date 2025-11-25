@@ -4,108 +4,163 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+
+/**
+ * Coordinates fetching dashboard data from:
+ *  - external APIs (weather, fact, IP)
+ *  - Redis cache (to avoid unnecessary calls)
+ *
+ * High-level algorithm:
+ * <ol>
+ *     <li>Try reading last successful dashboard JSON from Redis.</li>
+ *     <li>If present → return cached JSON.</li>
+ *     <li>If absent → fetch all API data in parallel.</li>
+ *     <li>Build aggregated JSON, store in Redis with TTL, return it.</li>
+ * </ol>
+ */
 public class DashboardService {
 
     private static final Logger LOG = LoggerFactory.getLogger(DashboardService.class);
 
-    private static final String DASHBOARD_CACHE_KEY = "dashboard:lastSuccess";
-    private static final long CACHE_TTL_SECONDS = 60L;
+    // Redis cache config
+    private static final String CACHE_KEY = "dashboard:lastSuccess";
+    private static final long CACHE_TTL_SECONDS = 60;
 
-    private final ExternalApiClient apiClient;
-    private final RedisCache redisCache;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    // JSON fields
+    private static final String WEATHER_FIELD = "weather";
+    private static final String FACT_FIELD = "fact";
+    private static final String IP_FIELD = "ip";
 
-    public DashboardService(ExternalApiClient apiClient, RedisCache redisCache) {
-        this.apiClient = apiClient;
-        this.redisCache = redisCache;
+    private final ExternalApi api;      // External API abstraction
+    private final RedisCache redis;     // Redis async wrapper
+    private final ObjectMapper mapper;  // JSON builder
+
+    /**
+     * Convenience constructor – creates default ObjectMapper.
+     */
+    public DashboardService(ExternalApi api, RedisCache redis) {
+        this(api, redis, new ObjectMapper());
     }
 
     /**
-     * Public API:
-     * 1) Try to read from Redis cache.
-     * 2) If cache hit – immediately return cached JSON.
-     * 3) If cache misses – fetch fresh data from external APIs and store in Redis.
+     * Main constructor – makes testing easier.
+     */
+    public DashboardService(ExternalApi api, RedisCache redis, ObjectMapper mapper) {
+        this.api = Objects.requireNonNull(api, "api must not be null");
+        this.redis = Objects.requireNonNull(redis, "redis must not be null");
+        this.mapper = Objects.requireNonNull(mapper, "mapper must not be null");
+    }
+
+    /**
+     * Returns dashboard JSON, preferring Redis cache.
      */
     public CompletableFuture<String> getDashboardJson() {
-        LOG.debug("DashboardService.getDashboardJson invoked");
-
-        return redisCache.get(DASHBOARD_CACHE_KEY)
-                .thenCompose(this::resolveFromCacheOrFetchFresh);
+        LOG.info("getDashboardJson() invoked");
+        return redis.get(CACHE_KEY)
+                .thenCompose(this::resolveFromCacheOrFetch);
     }
 
     /**
-     * Decide whether to use cached JSON or fetch fresh data.
+     * If cache HIT → return cached JSON.
+     * If cache MISS → fetch from external APIs.
      */
-    private CompletableFuture<String> resolveFromCacheOrFetchFresh(Optional<String> cachedJson) {
-        if (cachedJson.isPresent()) {
-            LOG.debug("Dashboard cache HIT");
-            return CompletableFuture.completedFuture(cachedJson.get());
+    private CompletableFuture<String> resolveFromCacheOrFetch(Optional<String> cachedOpt) {
+        if (cachedOpt.isPresent()) {
+            LOG.info("Cache HIT for key={}", CACHE_KEY);
+            return CompletableFuture.completedFuture(cachedOpt.get());
         }
 
-        LOG.debug("Dashboard cache MISS, fetching from external APIs");
-        return fetchFreshAndCache();
+        LOG.info("Cache MISS for key={}, fetching external data…", CACHE_KEY);
+        return fetchAndCache();
     }
 
     /**
-     * Fetch data from all external APIs, build JSON and store it in Redis.
+     * Fetch weather, fact, and IP concurrently,
+     * convert them to a single JSON object,
+     * save to Redis (with TTL),
+     * return final JSON.
      */
-    private CompletableFuture<String> fetchFreshAndCache() {
-        CompletableFuture<JsonNode> weatherFuture = apiClient.getWeather();
-        CompletableFuture<JsonNode> factFuture = apiClient.getRandomFact();
-        CompletableFuture<JsonNode> ipFuture = apiClient.getPublicIp();
+    private CompletableFuture<String> fetchAndCache() {
+        return fetchDashboardData()
+                .thenApply(this::toJson)
+                .thenCompose(this::saveToCacheWithLogging);
+    }
 
-        CompletableFuture<Void> all = CompletableFuture.allOf(
-                weatherFuture, factFuture, ipFuture
-        );
+    /**
+     * Fetch all 3 external API responses in parallel.
+     * Uses the new fetch* methods.
+     */
+    private CompletableFuture<DashboardData> fetchDashboardData() {
+        CompletableFuture<JsonNode> weatherF = api.fetchWeather();
+        CompletableFuture<JsonNode> factF = api.fetchRandomFact();
+        CompletableFuture<JsonNode> ipF = api.fetchPublicIp();
 
-        return all
-                .thenApply(ignored ->
-                        buildDashboardJson(
-                                weatherFuture.join(),
-                                factFuture.join(),
-                                ipFuture.join()
-                        )
-                )
-                .thenCompose(json ->
-                        saveToCacheWithTtl(DASHBOARD_CACHE_KEY, json, CACHE_TTL_SECONDS)
-                                .thenApply(v -> json)
-                )
-                .exceptionally(ex -> {
-                    LOG.error("Failed to fetch fresh dashboard data", ex);
-                    // здесь уже нет смысла второй раз идти в кэш:
-                    // если кэш был, мы бы его использовали раньше
-                    throw new CompletionException(ex);
+        // Combine 3 futures without blocking join()
+        return weatherF
+                .thenCombine(factF, (w, f) -> new DashboardData(w, f, null))
+                .thenCombine(ipF, (df, ip) -> new DashboardData(df.weather(), df.fact(), ip));
+    }
+
+    /**
+     * Saves JSON into Redis and logs result.
+     * Redis failures DO NOT fail main future.
+     */
+    private CompletableFuture<String> saveToCacheWithLogging(String json) {
+        return redis.save(CACHE_KEY, json, CACHE_TTL_SECONDS)
+                .handle((ignored, ex) -> {
+                    if (ex != null) {
+                        LOG.warn("Failed to save JSON to Redis key={}", CACHE_KEY, ex);
+                    } else {
+                        LOG.info("Saved JSON to Redis key={} ttlSeconds={}",
+                                CACHE_KEY, CACHE_TTL_SECONDS);
+                    }
+                    return json;
                 });
     }
 
     /**
-     * Build final dashboard JSON from parts.
+     * Build the JSON body:
+     * {
+     *   "weather": {...},
+     *   "fact": {...},
+     *   "ip": {...}
+     * }
      */
-    private String buildDashboardJson(JsonNode weather, JsonNode fact, JsonNode ip) {
-        ObjectNode root = objectMapper.createObjectNode();
-        root.set("weather", weather);
-        root.set("fact", fact);
-        root.set("ip", ip);
+    private ObjectNode buildRootNode(DashboardData data) {
+        ObjectNode root = mapper.createObjectNode();
+        root.set(WEATHER_FIELD, data.weather());
+        root.set(FACT_FIELD, data.fact());
+        root.set(IP_FIELD, data.ip());
+        return root;
+    }
+
+    /**
+     * Serialize an ObjectNode into JSON string.
+     */
+    private String toJson(ObjectNode root) {
         try {
-            return objectMapper.writeValueAsString(root);
+            return mapper.writeValueAsString(root);
         } catch (JsonProcessingException e) {
             throw new CompletionException(e);
         }
     }
 
     /**
-     * Save JSON to Redis with optional TTL.
+     * Serialize DashboardData → JSON string.
      */
-    private CompletableFuture<Void> saveToCacheWithTtl(String key, String json, long ttlSeconds) {
-        if (ttlSeconds <= 0) {
-            return redisCache.save(key, json);
-        }
-        return redisCache.save(key, json, ttlSeconds);
+    private String toJson(DashboardData data) {
+        return toJson(buildRootNode(data));
     }
+
+    /**
+     * Typed container for aggregated data.
+     */
+    private record DashboardData(JsonNode weather, JsonNode fact, JsonNode ip) {}
 }
