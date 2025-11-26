@@ -30,10 +30,11 @@ public record ExternalApiClient(HttpClient httpClient, ObjectMapper objectMapper
     /** Open-Meteo API — current weather for Warsaw (current_weather node). */
     private static final String WEATHER_URL =
             "https://api.open-meteo.com/v1/forecast" +
-                    "?latitude=52.23&longitude=21.01&current_weather=true";
+                    "?latitude=51.107883&longitude=17.038538&current_weather=true";
 
     /** Random joke API, returns a JSON object with the 'value' field. */
-    private static final String FACT_URL = "https://api.chucknorris.io/jokes/random";
+    private static final String FACT_URL =
+            "https://uselessfacts.jsph.pl/api/v2/facts/random";
 
     /** Public IP provider, returns {"ip": "..."} JSON. */
     private static final String IP_URL = "https://api.ipify.org?format=json";
@@ -105,7 +106,10 @@ public record ExternalApiClient(HttpClient httpClient, ObjectMapper objectMapper
     @Override
     public CompletableFuture<JsonNode> fetchRandomFact() {
         return sendJsonRequest(FACT_URI)
-                .thenApply(ensureHasField("value"));
+                .thenApply(json -> {
+                    String fact = json.get("text").asText();
+                    return objectMapper.createObjectNode().put("fact", fact);
+                });
     }
 
     /**

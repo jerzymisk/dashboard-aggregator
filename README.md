@@ -126,7 +126,7 @@ A small Netty-based HTTP service that aggregates data from several external APIs
       "...": "..."
     },
     "fact": {
-      "value": "Some random fact",
+      "text": "Some random fact",
       "...": "..."
     },
     "ip": {
@@ -253,3 +253,5 @@ Notes
 •	All external calls are asynchronous and non-blocking.
 •	Redis write failures do not break the main dashboard response – the service still returns fresh data.
 •	The design is interface-driven (ExternalApi, RedisCache) for better testability and future extensions.
+
+Jerzy Miskiewicz

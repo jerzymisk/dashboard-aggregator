@@ -16,7 +16,6 @@ import java.util.concurrent.CompletionException;
  * Coordinates fetching dashboard data from:
  *  - external APIs (weather, fact, IP)
  *  - Redis cache (to avoid unnecessary calls)
- *
  * High-level algorithm:
  * <ol>
  *     <li>Try reading last successful dashboard JSON from Redis.</li>
