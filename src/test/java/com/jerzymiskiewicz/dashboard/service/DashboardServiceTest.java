@@ -7,7 +7,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class DashboardServiceTest {
@@ -19,6 +19,7 @@ class DashboardServiceTest {
     private static final String WEATHER_FIELD = "weather";
     private static final String FACT_FIELD = "fact";
     private static final String IP_FIELD = "ip";
+    private static final String FACT_ERROR_FIELD = "fact_error";
     private static final String CACHED_JSON_SAMPLE = "{\"cached\":true}";
 
     @Test
@@ -74,6 +75,43 @@ class DashboardServiceTest {
         verify(api).fetchWeather();
         verify(api).fetchRandomFact();
         verify(api).fetchPublicIp();
+    }
+
+    @Test
+    void whenCacheMiss_andFactApiFails_thenDashboardStillReturnedWithoutCaching() throws Exception {
+        // given
+        ExternalApi api = mock(ExternalApi.class);
+        RedisCache redis = mock(RedisCache.class);
+
+        stubCacheMiss(redis);
+
+        JsonNode weather = mapper.readTree("{\"temp\": 1}");
+        JsonNode ip = mapper.readTree("{\"ip\": \"1.2.3.4\"}");
+
+        // weather & ip succeed
+        when(api.fetchWeather()).thenReturn(CompletableFuture.completedFuture(weather));
+        when(api.fetchPublicIp()).thenReturn(CompletableFuture.completedFuture(ip));
+        // fact API fails
+        when(api.fetchRandomFact()).thenReturn(
+                CompletableFuture.failedFuture(new RuntimeException("fact down"))
+        );
+
+        DashboardService service = newService(api, redis);
+
+        // when
+        String json = service.getDashboardJson().join();
+        JsonNode root = mapper.readTree(json);
+
+        // then: weather and ip are present
+        assertEquals(weather, root.get(WEATHER_FIELD));
+        assertEquals(ip, root.get(IP_FIELD));
+
+        // fact is missing, but error field is present
+        assertFalse(root.has(FACT_FIELD));
+        assertEquals("unavailable", root.get(FACT_ERROR_FIELD).asText());
+
+        // Redis must NOT be updated because not all APIs succeeded
+        verify(redis, never()).save(eq(CACHE_KEY), anyString(), anyLong());
     }
 
     // --- Helpers to configure Redis mock ---
