@@ -32,7 +32,7 @@ public record ExternalApiClient(HttpClient httpClient, ObjectMapper objectMapper
             "https://api.open-meteo.com/v1/forecast" +
                     "?latitude=51.107883&longitude=17.038538&current_weather=true";
 
-    /** Random joke API, returns a JSON object with the 'value' field. */
+    /** Random fact API: we read the 'text' field and expose it as {"fact": "..."} */
     private static final String FACT_URL =
             "https://uselessfacts.jsph.pl/api/v2/facts/random";
 
@@ -103,15 +103,16 @@ public record ExternalApiClient(HttpClient httpClient, ObjectMapper objectMapper
      * Fetches a random joke and validates that the "value" field is present.
      * The whole JSON object is returned to the caller.
      */
+
     @Override
     public CompletableFuture<JsonNode> fetchRandomFact() {
         return sendJsonRequest(FACT_URI)
                 .thenApply(json -> {
-                    String fact = json.get("text").asText();
-                    return objectMapper.createObjectNode().put("fact", fact);
+                    String factText = json.get("text").asText();
+                    return objectMapper.createObjectNode()
+                            .put("fact", factText);
                 });
     }
-
     /**
      * Fetches the public IP and validates the "ip" field.
      * The whole JSON object is returned to the caller.

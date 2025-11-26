@@ -26,7 +26,9 @@ class ExternalApiClientTest {
     private ObjectMapper objectMapper;
     private ExternalApiClient apiClient;
 
-    private static final String FACT_JSON_WITH_VALUE = "{\"value\": 42}";
+
+
+    private static final String FACT_JSON = "{\"text\": \"hello\"}";
     private static final String INVALID_JSON = "not-a-json-body";
 
     @BeforeEach
@@ -40,13 +42,13 @@ class ExternalApiClientTest {
     @Test
     void given2xxResponse_whenFetchRandomFact_thenReturnsParsedJson() {
         // given
-        stubSendAsyncResponse(200, FACT_JSON_WITH_VALUE);
+        stubSendAsyncResponse(200, FACT_JSON);
 
         // when
         JsonNode result = apiClient.fetchRandomFact().join();
 
         // then
-        assertEquals(42, result.get("value").asInt());
+        assertEquals("hello", result.get("fact").asText());
     }
 
     @Test
