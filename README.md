@@ -30,7 +30,7 @@ A small Netty-based HTTP service that aggregates data from several external APIs
 
 - **NettyServer**
     - Boots Netty on port `8080`
-    - Reads Redis host/port from environment:
+    - Reads Redis host/port from environment variables:
         - `REDIS_HOST` (default: `redis`)
         - `REDIS_PORT` (default: `6379`)
     - Creates `RedisCache`, `ExternalApiClient`, `DashboardService`
@@ -40,66 +40,56 @@ A small Netty-based HTTP service that aggregates data from several external APIs
     - Pipeline:
         - `HttpServerCodec`
         - `HttpObjectAggregator`
-        - `HealthHandler` (handles `GET /health`, otherwise forwards)
-        - `DashboardHandler` (handles `GET /api/dashboard`, otherwise returns `404`)
+        - `HealthHandler`
+        - `DashboardHandler`
 
 - **HealthHandler**
-    - For `GET /health` returns:
+    - Handles `GET /health`
+    - Always returns:
       ```json
       {"status":"UP"}
       ```
-    - For any other request passes it further down the pipeline
 
 - **DashboardHandler**
-    - Routes:
-        - `GET /api/dashboard` → calls `DashboardService#getDashboardJson()`
-        - Any other path → `404 NOT_FOUND`
-    - Sends JSON responses with `Content-Type: application/json; charset=utf-8`
+    - Handles `GET /api/dashboard`
+    - Returns JSON with:
+        - weather info
+        - random fact
+        - public IP
+    - For unknown paths returns `404 NOT_FOUND`
 
 ### Service Layer
 
-- **ExternalApi (interface)**
-    - Asynchronous contract for external API calls:
-        - `CompletableFuture<JsonNode> fetchWeather()`
-        - `CompletableFuture<JsonNode> fetchRandomFact()`
-        - `CompletableFuture<JsonNode> fetchPublicIp()`
+- **ExternalApi**
+    - Contract for async external API calls:
+        - `fetchWeather()`
+        - `fetchRandomFact()`
+        - `fetchPublicIp()`
 
-- **ExternalApiClient (record)**
-    - Implements `ExternalApi` using Java `HttpClient`
-    - Non-blocking HTTP calls
-    - Safe JSON parsing with `ObjectMapper`
-    - Validates required JSON fields:
-        - weather: field `"temp"`
-        - fact: field `"value"`
-        - IP: field `"ip"`
+- **ExternalApiClient**
+    - Implements `ExternalApi`
+    - Non-blocking HTTP calls using Java `HttpClient`
+    - Validates JSON fields
+    - Safe parsing with Jackson `ObjectMapper`
 
 - **RedisCache**
-    - Async wrapper around Lettuce Redis client
-    - Methods:
-        - `save(key, value)`
-        - `save(key, value, long ttlSeconds)`
-        - `save(key, value, Duration ttl)`
-        - `get(key): CompletableFuture<Optional<String>>`
-    - Validates keys and TTL, logs operations
-    - `close()` is idempotent and safely closes client & connection
+    - Async wrapper over Lettuce Redis client
+    - Provides:
+        - `save`
+        - `save with TTL`
+        - `get`
+    - Validates keys, throws on invalid TTL
+    - `close()` is idempotent
 
 - **DashboardService**
-    - High-level algorithm:
-        1. Try to read cached JSON from Redis (`dashboard:lastSuccess`)
-        2. On cache HIT → return cached JSON
-        3. On cache MISS:
-            - Fetch weather, fact, and IP in parallel using `ExternalApi`
-            - Build combined JSON:
-              ```json
-              {
-                "weather": { ... },
-                "fact":    { ... },
-                "ip":      { ... }
-              }
-              ```
+    - Algorithm:
+        1. Try cache → return cached if exists
+        2. On cache MISS:
+            - Fetch weather + fact + IP in parallel
+            - Build combined JSON
             - Save to Redis with TTL
-            - Return JSON to caller (even if Redis save failed)
-    - Uses an internal `DashboardData` record to hold aggregated data
+            - Return JSON (even if Redis save fails)
+    - Uses an internal record `DashboardData`
 
 ---
 
@@ -107,151 +97,92 @@ A small Netty-based HTTP service that aggregates data from several external APIs
 
 ### `GET /health`
 
-- **Description:** Health check
-- **Response:**
-    - Status: `200 OK`
-    - Body:
-      ```json
-      {"status":"UP"}
-      ```
+Returns:
 
-### `GET /api/dashboard`
+```json
+{"status": "UP"}
 
-- **Description:** Returns aggregated dashboard JSON
-- **Response example:**
-  ```json
-  {
-    "weather": {
-      "temp": 1,
-      "...": "..."
-    },
-    "fact": {
-      "text": "Some random fact",
-      "...": "..."
-    },
-    "ip": {
-      "ip": "1.2.3.4"
-    }
-  }
+GET /api/dashboard
+
+Example:
+
+{
+  "weather": { "temp": 1, ... },
+  "fact":    { "fact": "Some random fact" },
+  "ip":      { "ip": "1.2.3.4" }
+}
 
 
 ⸻
 
 Requirements
-•	Java: 21 (LTS)
-•	Maven: 3.9+
-•	Redis: available on REDIS_HOST:REDIS_PORT
-•	(Optional) Docker: to run Redis / build containers easily
-
-⸻
-
-Running Redis with Docker
-
-You can start a local Redis instance using Docker:
-
-docker run --rm -p 6379:6379 --name redis \
-redis:7-alpine
-
-This exposes Redis on localhost:6379, which matches the default test configuration.
+	•	Java 21
+	•	Maven 3.9+
+	•	Redis (redis:6379)
+	•	Docker (optional, for building/running via compose)
 
 ⸻
 
 Running Tests
 
-All tests are standard JUnit 5 tests executed via Maven.
-
-# From the project root
 mvn clean test
 
-What is covered:
-•	RedisCacheTest – integration-like tests against a real Redis (on localhost:6379)
-•	ExternalApiClientTest – mocks HttpClient, verifies JSON parsing & error handling
-•	DashboardServiceTest – verifies cache HIT/MISS logic and JSON structure
-•	DashboardHandlerTest – verifies HTTP routing & status codes with EmbeddedChannel
+Test suites:
+	•	RedisCacheTest – integration-style tests with Redis
+	•	ExternalApiClientTest – mocked HttpClient
+	•	DashboardServiceTest – HIT/MISS logic
+	•	DashboardHandlerTest – routing via EmbeddedChannel
 
-Make sure Redis is running before executing the tests.
+Make sure Redis is running locally before running tests.
+
 
 ⸻
 
-Running the Application Locally
+Running via Docker — ONE COMMAND
 
-From the project root:
+This project includes:
+	•	Dockerfile — multi-stage build (Maven → Runtime)
+	•	docker-compose.yml — Redis + App with healthcheck
 
-# Build the project
+Start everything with one command:
+
+docker compose up --build
+
+This will:
+	•	Build the JAR inside Docker
+	•	Build the runtime image
+	•	Start Redis
+	•	Wait until Redis is healthy
+	•	Start your application
+	•	Expose:
+	•	http://localhost:8080/health
+	•	http://localhost:8080/api/dashboard
+
+Stop:
+
+docker compose down
+
+
+⸻
+
+Running the Application Locally (without Docker)
+
+Build:
+
 mvn clean package
 
-Then run the Netty server (assuming the default JAR name):
-
-java -cp target/dashboard-aggregator-1.0-SNAPSHOT.jar \
-com.jerzymiskiewicz.dashboard.NettyServer
-
-Or if you use a fat JAR with a manifest (depending on your Maven configuration):
+Run:
 
 java -jar target/dashboard-aggregator-1.0-SNAPSHOT.jar
 
-Environment variables
-
-You can override Redis host/port:
+Override Redis host/port:
 
 export REDIS_HOST=localhost
 export REDIS_PORT=6379
 
-
-⸻
-
-Quick Manual Test
-
-After starting Redis and the Netty server:
-
-# Health check
-curl http://localhost:8080/health
-# -> {"status":"UP"}
-
-# Dashboard (first call – cache MISS, external APIs are called)
-curl http://localhost:8080/api/dashboard
-
-# Dashboard (subsequent calls within TTL – cache HIT)
-curl http://localhost:8080/api/dashboard
-
-
-⸻
-
-Running via Docker (example)
-
-If you have a Dockerfile in the project, a typical flow looks like this:
-
-# Build JAR
-mvn clean package
-
-# Build Docker image
-docker build -t dashboard-aggregator .
-
-# Run together with Redis
-docker network create dashboard-net || true
-
-docker run -d --rm \
---name redis \
---network dashboard-net \
-redis:7-alpine
-
-docker run -d --rm \
---name dashboard-aggregator \
---network dashboard-net \
--e REDIS_HOST=redis \
--e REDIS_PORT=6379 \
--p 8080:8080 \
-dashboard-aggregator
-
-Then access:
+Test manually:
 
 curl http://localhost:8080/health
 curl http://localhost:8080/api/dashboard
-
-⸻
-
-Notes
-•	All external calls are asynchronous and non-blocking.
-•	Redis write failures do not break the main dashboard response – the service still returns fresh data.
-•	The design is interface-driven (ExternalApi, RedisCache) for better testability and future extensions.
 
 Jerzy Miskiewicz
